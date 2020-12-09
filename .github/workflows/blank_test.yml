@@ -1,3 +1,4 @@
+name: RTU_CI
 include:
 # 54 -> ID of plc_fw_externalrc/yaffs
 # If the project is private, we need to specify the private_token
