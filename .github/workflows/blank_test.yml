@@ -1,36 +1,188 @@
-# This is a basic workflow to help you get started with Actions
+include:
+# 54 -> ID of plc_fw_externalrc/yaffs
+# If the project is private, we need to specify the private_token
+# An include variable must end with .yml. &test=.yml does nothing. It is just to not have the YAML error :'Remote file xxxxx not valid'
+  - '.common-rtu-gitlab-ci.yml'
+  - '.test-gitlab-ci.yml'
+  - 'http://plclab.aut.schneider-electric.com/api/v4/projects/54/repository/files/.common-yaffs-gitlab-ci.yml/raw?ref=master&private_token=j5itFgUh7_-wZHPeY2kn&test=.yml'
 
-name: CI/CD
+variables:
+  LM_LICENSE_FILE: "27005@so-poly1.aut.schneider-electric.com"
+  WRSD_LICENSE_FILE: "27005@so-poly1.aut.schneider-electric.com"
+  kl_server_name: "https://wkworkprd13128.gad.schneider-electric.com"
+  kl_server_port: 8080
+  kl_project: "BME_NOR"
+  TZ: 'Europe/Paris'
 
-# Controls when the action will run. 
-on:
-  # Triggers the workflow on push or pull request events but only for the main branch
-  push:
-    branches: [ main ]
-  pull_request:
-    branches: [ main ]
+.rtu_linux_carros_dedicated-runner: &rtu_linux_carros_dedicated-runner
+  tags:
+  - DockerExecutor
 
-  # Allows you to run this workflow manually from the Actions tab
-  workflow_dispatch:
+.common_rtu_before_script: &rtu_before_script
+  extends: .rtu_before_script
 
-# A workflow run is made up of one or more jobs that can run sequentially or in parallel
-jobs:
-  # This workflow contains a single job called "build"
-  build:
-    # The type of runner that the job will run on
-    runs-on: ubuntu-latest
+stages:
+ - build
+ - build_nandimage
+ - qualimetry
+ - test_global
 
-    # Steps represent a sequence of tasks that will be executed as part of the job
-    steps:
-      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
-      - uses: actions/checkout@v2
+build_nandimage:linux:carros:
+  <<: *rtu_linux_carros_dedicated-runner
+  stage: build_nandimage
+  image: plcfactory.aut.schneider-electric.com:8084/ci/windriver7_sr620
+  <<: *rtu_before_script
+  script:
+  - echo "Build nandimage.bin"
+  - cd $workspace_build
+  - mkdir -p $workspace_build/plc_fw_externalsrc/yaffs/prj/tools-se/yaffsPc/nandImage/Linux-gnu-native-3.x-4.x/yaffs2nandImage/Debug
+  - cp $workspace_build/plc_fw_rtu_lces/artifacts_yaffs/* $workspace_build/plc_fw_externalsrc/yaffs/prj/tools-se/yaffsPc/nandImage/Linux-gnu-native-3.x-4.x/yaffs2nandImage/Debug
+  - cd $workspace_build/plc_fw_externalsrc/yaffs/src/tools-se/yaffs2NandImage/test
+  - cp $workspace_build/plc_fw_rtu_lces/artifacts_rtu/default/vxworks.itb .
+  - echo '2' > rtu.conf
+  - ./start_nandPadTool_rtu.sh .
+  - tar zcvhf nandimage.tar out/nandimage.bin
+  - cp nandimage.tar $CI_PROJECT_DIR
+  artifacts:
+    name: "rtu_projects_$CI_BUILD_STAGE_$CI_BUILD_REF_NAME"
+    paths:
+    - "$CI_PROJECT_DIR/nandimage.tar"
+    when: on_success
+    expire_in: 1 day
+  allow_failure: true
+  dependencies:
+    - release:linux:rtu:carros
+    - build:nandpadtool
 
-      # Runs a single command using the runners shell
-      - name: Run a one-line script
-        run: echo Hello, world!
+klocwork:linux:carros:
+  <<: *rtu_linux_carros_dedicated-runner
+  variables:
+    LM_LICENSE_FILE: "27005@so-poly1.aut.schneider-electric.com"
+    WRSD_LICENSE_FILE: "27005@so-poly1.aut.schneider-electric.com"
+    WINDRIVER_PATH: "windriver7_sr620"
+  image: plcfactory.aut.schneider-electric.com:8084/ci/windriver7_sr620:latest
+  stage: qualimetry
+  <<: *rtu_before_script
+  script:
+  - export KLOCWORK_LICENSE_FILE=27002@PFRWFLM2.eur.gad.schneider-electric.com
+  # Get authentication token to KW from docker volume
+  - if [ -d "$HOME/.klocwork" ] ; then rm -rf $HOME/.klocwork ; fi
+  - cp -r $HOME/volume_docker_ci/.klocwork $HOME/
+  - export COMMIT_ID=${CI_COMMIT_SHA:0:8}
+  - echo "Check if build exists..."
+  - export token_kw=$(cat $HOME/.klocwork/ltoken | cut -d';' -f4)
+  - check_server=$(curl -s --insecure --data "ltoken=$token_kw&action=builds&user=sesi000823&project=$kl_project" $kl_server_name:$kl_server_port/review/api | grep $COMMIT_ID) || echo "Build doesn't exist"
+  - if [ -n "$check_server" ] ; then echo "Build already exists. No need to do qualimetry" && exit 0 ; fi
+  - cd $workspace_build/plc_fw_rtu_lces
+  - if [ -d "sca" ] ; then rm -rf sca ; fi
+  - mkdir sca
+  - export spec_home=$(pwd)/sca
+  - export kltables_home=$(pwd)/tables
+  - echo "Start of building rtu_vsb_lces"
+  - wrenv.sh -p vxworks-7 wrtool.sh -data $WIND_WRTOOL_WORKSPACE prj import $workspace_build/plc_fw_rtu_lces/prj/rtu_vsb_lces/ -ignoreexisting
+  - cd $workspace_build/plc_fw_rtu_lces/prj/rtu_vsb_lces
+  - wrenv.sh -p vxworks-7 $WINDRIVER_DRIVE/$WINDRIVER_PATH/utilities/x86-linux2/bin/make -f Makefile WIND_WRTOOL_WORKSPACE=$WIND_WRTOOL_WORKSPACE WIND_PRJ_NAME=rtu_vsb_lces patch_vx7
+  - wrenv.sh -p vxworks-7 $WINDRIVER_DRIVE/$WINDRIVER_PATH/utilities/x86-linux2/bin/make -f Makefile WIND_WRTOOL_WORKSPACE=$WIND_WRTOOL_WORKSPACE WIND_PRJ_NAME=rtu_vsb_lces create_vsb
+  - wrenv.sh -p vxworks-7 $WINDRIVER_DRIVE/$WINDRIVER_PATH/utilities/x86-linux2/bin/make -f Makefile WIND_WRTOOL_WORKSPACE=$WIND_WRTOOL_WORKSPACE WIND_PRJ_NAME=rtu_vsb_lces build_vsb
+  - cd $workspace_build/plc_fw_rtu_lces
+  - echo "End of building rtu_vsb_lces"
+  - echo "Import projects"
+  - wrenv.sh -p vxworks-7 wrtool.sh -data $WIND_WRTOOL_WORKSPACE prj import $workspace_build/plc_fw_rtu_lces/prj/rtu_dkm_lces/ -ignoreexisting
+  - wrenv.sh -p vxworks-7 wrtool.sh -data $WIND_WRTOOL_WORKSPACE prj import $workspace_build/plc_fw_rtu_lces/prj/rtu_rtp_lces/ -ignoreexisting
+  - wrenv.sh -p vxworks-7 wrtool.sh -data $WIND_WRTOOL_WORKSPACE prj import $workspace_build/plc_fw_rtu_lces/prj/rtu_rtp_eventlog_cmake/ -ignoreexisting
+  - wrenv.sh -p vxworks-7 wrtool.sh -data $WIND_WRTOOL_WORKSPACE prj import $workspace_build/plc_fw_rtu_lces/prj/rtu_rtp_fwupgrade/ -ignoreexisting
+  - wrenv.sh -p vxworks-7 wrtool.sh -data $WIND_WRTOOL_WORKSPACE prj import $workspace_build/plc_fw_rtu_lces/prj/rtu_webimg/ -ignoreexisting
+  - wrenv.sh -p vxworks-7 wrtool.sh -data $WIND_WRTOOL_WORKSPACE prj import $workspace_build/plc_fw_rtu_lces/prj/rtu_web_pages/ -ignoreexisting
+  - wrenv.sh -p vxworks-7 wrtool.sh -data $WIND_WRTOOL_WORKSPACE prj import $workspace_build/plc_fw_rtu_lces/prj/rtu_romfs_lces/ -ignoreexisting
+  - wrenv.sh -p vxworks-7 wrtool.sh -data $WIND_WRTOOL_WORKSPACE prj import $workspace_build/plc_fw_rtu_lces/prj/rtu_vip_lces_vx7/ -ignoreexisting
+  - wrenv.sh -p vxworks-7 wrtool.sh -data $WIND_WRTOOL_WORKSPACE prj import $workspace_build/plc_fw_rtu_lces/prj/rtu_apps_lces/ -ignoreexisting
+  - wrenv.sh -p vxworks-7 wrtool.sh prj list
+  - echo "Start of building rtu_dkm_lces"
+  - wrenv.sh -p vxworks-7 wrtool.sh -data $WIND_WRTOOL_WORKSPACE prj import $workspace_build/plc_fw_rtu_lces/prj/rtu_dkm_lces/ -ignoreexisting
+  - wrenv.sh -p vxworks-7 wrtool.sh -data $WIND_WRTOOL_WORKSPACE prj buildspec set rtu_vsb_lces_rzn1d_ARMARCH7llvm_SMP rtu_dkm_lces
+  - wrenv.sh -p vxworks-7 wrtool.sh -data $WIND_WRTOOL_WORKSPACE prj debugmode set 0 rtu_dkm_lces
+  - wrenv.sh -p vxworks-7 wrtool.sh -data $WIND_WRTOOL_WORKSPACE prj clean rtu_dkm_lces
+  - wrenv.sh -p vxworks-7 wrtool.sh -data $WIND_WRTOOL_WORKSPACE prj refresh rtu_dkm_lces
+  - kwinject -o $spec_home/rtu_dkm_lces_nondebug.out wrenv.sh -p vxworks-7 wrtool.sh -data $WIND_WRTOOL_WORKSPACE prj build rtu_dkm_lces -- TRACE=0
+  - ls -alh $workspace_build/plc_fw_rtu_lces/prj/rtu_dkm_lces
+  - ls -alh $spec_home
+  - echo "End of building rtu_dkm_lces"
+  - echo "Start of building rtu_rtp_lces"
+  - wrenv.sh -p vxworks-7 wrtool.sh -data $WIND_WRTOOL_WORKSPACE prj import $workspace_build/plc_fw_rtu_lces/prj/rtu_rtp_lces/ -ignoreexisting
+  - wrenv.sh -p vxworks-7 wrtool.sh -data $WIND_WRTOOL_WORKSPACE prj buildspec set rtu_vsb_lces_rzn1d_ARMARCH7llvm rtu_rtp_lces
+  - wrenv.sh -p vxworks-7 wrtool.sh -data $WIND_WRTOOL_WORKSPACE prj debugmode set 0  rtu_rtp_lces
+  - wrenv.sh -p vxworks-7 wrtool.sh -data $WIND_WRTOOL_WORKSPACE prj clean rtu_rtp_lces
+  - wrenv.sh -p vxworks-7 wrtool.sh -data $WIND_WRTOOL_WORKSPACE prj refresh rtu_rtp_lces
+  - kwinject -o $spec_home/rtu_rtp_lces_nondebug.out wrenv.sh -p vxworks-7 wrtool.sh -data $WIND_WRTOOL_WORKSPACE prj build rtu_rtp_lces
+  - ls -alh $workspace_build/plc_fw_rtu_lces/prj/rtu_rtp_lces
+  - ls -alh $spec_home
+  - echo "End of building rtu_rtp_lces"
+  - echo "Start of building rtu_rtp_eventlog_cmake"
+  - wrenv.sh -p vxworks-7 wrtool.sh -data $WIND_WRTOOL_WORKSPACE prj import $workspace_build/plc_fw_rtu_lces/prj/rtu_rtp_eventlog_cmake/ -ignoreexisting
+  - wrenv.sh -p vxworks-7 wrtool.sh -data $WIND_WRTOOL_WORKSPACE prj buildspec set rtu_vsb_lces_rzn1d_ARMARCH7llvm rtu_rtp_eventlog_cmake
+  - wrenv.sh -p vxworks-7 wrtool.sh -data $WIND_WRTOOL_WORKSPACE prj debugmode set 0 rtu_rtp_eventlog_cmake
+  - wrenv.sh -p vxworks-7 wrtool.sh -data $WIND_WRTOOL_WORKSPACE prj clean rtu_rtp_eventlog_cmake
+  - wrenv.sh -p vxworks-7 wrtool.sh -data $WIND_WRTOOL_WORKSPACE prj refresh rtu_rtp_eventlog_cmake
+  - kwinject -o $spec_home/rtu_rtp_eventlog_cmake.out wrenv.sh -p vxworks-7 wrtool.sh -data $WIND_WRTOOL_WORKSPACE prj build rtu_rtp_eventlog_cmake
+  - ls -alh $workspace_build/plc_fw_rtu_lces/prj/rtu_rtp_eventlog_cmake
+  - ls -alh $spec_home
+  - echo "End of building rtu_rtp_eventlog_cmake"
+  - echo "Start of building rtu_rtp_fwupgrade"
+  - wrenv.sh -p vxworks-7 wrtool.sh -data $WIND_WRTOOL_WORKSPACE prj import $workspace_build/plc_fw_rtu_lces/prj/rtu_rtp_fwupgrade/ -ignoreexisting
+  - wrenv.sh -p vxworks-7 wrtool.sh -data $WIND_WRTOOL_WORKSPACE prj buildspec set rtu_vsb_lces_rzn1d_ARMARCH7llvm rtu_rtp_fwupgrade
+  - wrenv.sh -p vxworks-7 wrtool.sh -data $WIND_WRTOOL_WORKSPACE prj debugmode set 0 rtu_rtp_fwupgrade
+  - wrenv.sh -p vxworks-7 wrtool.sh -data $WIND_WRTOOL_WORKSPACE prj clean rtu_rtp_fwupgrade
+  - wrenv.sh -p vxworks-7 wrtool.sh -data $WIND_WRTOOL_WORKSPACE prj refresh rtu_rtp_fwupgrade
+  - kwinject -o $spec_home/rtu_rtp_fwupgrade.out wrenv.sh -p vxworks-7 wrtool.sh -data $WIND_WRTOOL_WORKSPACE prj build rtu_rtp_fwupgrade
+  - ls -alh $workspace_build/plc_fw_rtu_lces/prj/rtu_rtp_fwupgrade
+  - ls -alh $spec_home
+  - echo "End of building rtu_rtp_fwupgrade"
+  - echo "Start of building rtu_web_pages"
+  - wrenv.sh -p vxworks-7 wrtool.sh -data $WIND_WRTOOL_WORKSPACE prj import $workspace_build/plc_fw_rtu_lces/prj/rtu_web_pages/ -ignoreexisting
+  - wrenv.sh -p vxworks-7 wrtool.sh -data $WIND_WRTOOL_WORKSPACE prj clean rtu_web_pages
+  - wrenv.sh -p vxworks-7 wrtool.sh -data $WIND_WRTOOL_WORKSPACE prj refresh rtu_web_pages
+  - kwinject -o $spec_home/rtu_web_pages.out wrenv.sh -p vxworks-7 wrtool.sh -data $WIND_WRTOOL_WORKSPACE prj build rtu_web_pages
+  - ls -alh $workspace_build/plc_fw_rtu_lces/prj/rtu_web_pages
+  - ls -alh $spec_home
+  - echo "End of building rtu_web_pages"
+  - echo "Start of building rtu_romfs_lces"
+  - wrenv.sh -p vxworks-7 wrtool.sh -data $WIND_WRTOOL_WORKSPACE prj import $workspace_build/plc_fw_rtu_lces/prj/rtu_romfs_lces/ -ignoreexisting
+  - wrenv.sh -p vxworks-7 wrtool.sh -data $WIND_WRTOOL_WORKSPACE prj clean rtu_romfs_lces
+  - wrenv.sh -p vxworks-7 wrtool.sh -data $WIND_WRTOOL_WORKSPACE prj refresh rtu_romfs_lces
+  - kwinject -o $spec_home/rtu_romfs_lces.out wrenv.sh -p vxworks-7 wrtool.sh -data $WIND_WRTOOL_WORKSPACE prj build rtu_romfs_lces
+  - ls -alh $workspace_build/plc_fw_rtu_lces/prj/rtu_romfs_lces
+  - ls -alh $spec_home
+  - echo "End of building rtu_romfs_lces"
+  - echo "Start of building rtu_vip_lces_vx7 ..."
+  - wrenv.sh -p vxworks-7 wrtool.sh -data $WIND_WRTOOL_WORKSPACE prj import $workspace_build/plc_fw_rtu_lces/prj/rtu_vip_lces_vx7/ -ignoreexisting
+  - wrenv.sh -p vxworks-7 wrtool.sh -data $WIND_WRTOOL_WORKSPACE prj clean rtu_vip_lces_vx7
+  - wrenv.sh -p vxworks-7 wrtool.sh -data $WIND_WRTOOL_WORKSPACE prj refresh rtu_vip_lces_vx7
+  - kwinject -o $spec_home/rtu_vip_lces_vx7.out wrenv.sh -p vxworks-7 wrtool.sh -data $WIND_WRTOOL_WORKSPACE prj build -j 8 rtu_vip_lces_vx7 -- DEBUG_MODE=0 TRACE=0
+  - ls -alh $workspace_build/plc_fw_rtu_lces/prj/rtu_vip_lces_vx7
+  - ls -alh $workspace_build/plc_fw_rtu_lces/prj/rtu_vip_lces_vx7/default/
+  - ls -alh $spec_home
+  - echo "End of building rtu_vip_lces_vx7"
+  - echo "Start of building rtu_lces ..."
+  - wrenv.sh -p vxworks-7 wrtool.sh -data $WIND_WRTOOL_WORKSPACE prj import $workspace_build/plc_fw_rtu_lces/prj/rtu_apps_lces/ -ignoreexisting
+  - wrenv.sh -p vxworks-7 wrtool.sh -data $WIND_WRTOOL_WORKSPACE prj clean rtu_lces
+  - wrenv.sh -p vxworks-7 wrtool.sh -data $WIND_WRTOOL_WORKSPACE prj refresh rtu_lces
+  - kwinject -o $spec_home/rtu_lces.out wrenv.sh -p vxworks-7 wrtool.sh -data $WIND_WRTOOL_WORKSPACE prj build -j 8 rtu_lces
+  - ls -alh $workspace_build/plc_fw_rtu_lces/prj/rtu_apps_lces
+  - ls -alh $workspace_build/plc_fw_rtu_lces/prj/rtu_apps_lces/NonDebug/
+  - ls -alh $spec_home
+  - echo "End of building rtu_lces"
+  - echo "Start of Analyzing Klocwork project plc_fw_rtu_lces"
+  - kwbuildproject -a "-DLOCAL=static -DSTATUS=int -DBOOL=uchar -DIMPORT=extern -DFAST=register" --force --url $kl_server_name:$kl_server_port/$kl_project --tables-directory  $kltables_home $spec_home/*.out || echo "INTEG::QUALIMETRY Errors detected"
+  - ls -alh $kltables_home
+  - echo "End of Analyzing Klocwork project plc_fw_rtu_lces"
+  - echo "Start of Publishing Klocwork project"
+  - kwadmin --url $kl_server_name:$kl_server_port load $kl_project $kltables_home --name $COMMIT_ID 2>&1 | tee kwadmin.txt
+  - if [ -z "$(cat kwadmin.txt | grep -i 'Build successfully created')" ] ; then echo "kwadmin FAILED!!!" && exit 1 ; fi
+  - echo "End ofPublishing Klocwork project"
+  - echo "End of building klocwork for $CI_PROJECT_NAME"
+  only:
+  - master
+  after_script: []
+  allow_failure: true
+  dependencies: []
 
-      # Runs a set of commands using the runners shell
-      - name: Run a multi-line script
-        run: |
-          echo Add other actions to build,
-          echo test, and deploy your project.
